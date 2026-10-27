@@ -51,6 +51,8 @@ class SamplingState:
     # scan and doubles as the -inf padding of a mask narrower than the logits
     fused_mask: torch.Tensor | None = None
     fused_dim: int | None = None
+    daddy_state: object | None = None
+    speculative_token: torch.Tensor | None = None
 
     def empty_sample(self):
         assert self.sample is None
@@ -254,6 +256,11 @@ class SS_Fused(SS_Base):
                     device = logits.device,
                 )
                 self.histograms[ws_key] = histogram
+
+        if state.daddy_state is not None:
+            state.sample = state.daddy_state.launch(logits, state, self, workspace, histogram)
+            state.state = SS.DONE
+            return
 
         state.sample = state.empty_sample()
         mask_is_bits = state.fused_mask is not None and state.fused_mask.dtype == torch.int32
@@ -1199,7 +1206,10 @@ class CustomSampler(Sampler):
         rand_u32: int | None = None,
         tokenizer: Tokenizer | None = None,
         logit_mask: torch.Tensor | None = None,
-        return_state: bool = False
+        return_state: bool = False,
+        *,
+        daddy_state = None,
+        speculative_token: torch.Tensor | None = None,
     ):
         out_shape = logits.shape[:-1]
 
@@ -1266,6 +1276,8 @@ class CustomSampler(Sampler):
             tokenizer = tokenizer,
             fused_mask = fused_mask,
             fused_dim = fused_dim,
+            daddy_state = daddy_state,
+            speculative_token = speculative_token,
         )
 
         for ss in self.steps:

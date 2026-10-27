@@ -39,3 +39,32 @@ void apply_logit_bitmask
     at::Tensor& logits_out,
     const at::Tensor& bitmask
 );
+
+// DADDy partials and diagnostic counters per row.
+#define DADDY_SAMPLER_PARTIAL_FLOATS 26
+// Counter columns: direct proposals, proposal fallback draws, all-full fallbacks.
+#define DADDY_SAMPLER_COUNTS 3
+
+void daddy_sampler
+(
+    const at::Tensor& logits,
+    const c10::optional<at::Tensor>& logit_mask,
+    const c10::optional<at::Tensor>& logit_bitmask,
+    at::Tensor& out,
+    at::Tensor& workspace,
+    int size,
+    float inv_temp,
+    float minp_log,
+    uint32_t random,
+    int mode,
+    int filters,
+    int top_k,
+    float top_p,
+    float inv_temp_filter,
+    const c10::optional<at::Tensor>& histogram,
+    const at::Tensor& daddy_workspace,
+    const at::Tensor& balances,
+    const at::Tensor& counts,
+    const c10::optional<at::Tensor>& draft,
+    uint32_t modulo
+);

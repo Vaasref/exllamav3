@@ -695,7 +695,43 @@ void fs_select_kernel
 // cheaper than a separate kernel launch); mode 3 reads the threshold selected from the
 // histogram instead
 
-template <typename T, int MODE>
+// Per-block DADDy state. Only these small partials cross the final reduction;
+// there is no vocabulary-sized probability or bin buffer.
+struct DaddyPartial
+{
+    float mass[8];
+    ValIdx winner[8];
+    int candidate_bin;
+    int padding;
+};
+static_assert(sizeof(DaddyPartial) == DADDY_SAMPLER_PARTIAL_FLOATS * sizeof(float));
+
+inline __device__ int daddy_bin(float log_relative)
+{
+    const float bounds[7] = {-3.506557897f, -2.525728644f, -1.897119985f,
+        -1.469675970f, -1.139434283f, -0.798507696f, -0.430782916f};
+    int b = 0;
+    #pragma unroll
+    for (int j = 0; j < 7; ++j) b += log_relative >= bounds[j];
+    return b;
+}
+
+inline __device__ float daddy_block_sum(float v)
+{
+    __shared__ float sums[FS_THREADS / 32];
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    for (int d = 16; d; d >>= 1) v += __shfl_down_sync(0xffffffff, v, d);
+    if (lane == 0) sums[warp] = v;
+    __syncthreads();
+    if (warp == 0)
+    {
+        v = lane < FS_THREADS / 32 ? sums[lane] : 0.0f;
+        for (int d = 16; d; d >>= 1) v += __shfl_down_sync(0xffffffff, v, d);
+    }
+    return v;
+}
+
+template <typename T, int MODE, bool DADDY = false>
 __global__ __launch_bounds__(FS_THREADS)
 void fs_partial_argmax_kernel
 (
@@ -714,7 +750,9 @@ void fs_partial_argmax_kernel
     const float minp_log,
     const int filters,
     const float inv_temp_filter,
-    const uint32_t random
+    const uint32_t random,
+    DaddyPartial* daddy_ws = nullptr,
+    const int64_t* draft = nullptr
 )
 {
     int row = blockIdx.y;
@@ -723,7 +761,8 @@ void fs_partial_argmax_kernel
     const uint32_t* row_bits = bits ? bits + (mask_per_row ? (size_t) row * bits_words : 0) : nullptr;
 
     float threshold = FS_NEG_INF;
-    if constexpr (MODE == 2)
+    float global_max = 0.0f;
+    if constexpr (MODE == 2 || (DADDY && MODE == 1))
     {
         float m = FS_NEG_INF;
         for (int j = threadIdx.x; j < num_blocks; j += FS_THREADS)
@@ -732,7 +771,8 @@ void fs_partial_argmax_kernel
         __shared__ float sh_m;
         if (threadIdx.x == 0) sh_m = m;
         __syncthreads();
-        threshold = sh_m + minp_log;
+        global_max = sh_m;
+        if constexpr (MODE == 2) threshold = sh_m + minp_log;
     }
 
     // Mode 3 keeps elements by their (bucket, sub-bucket) bin, evaluated with the exact
@@ -753,6 +793,24 @@ void fs_partial_argmax_kernel
             threshold = fs3_m + minp_log;
     }
 
+    if constexpr (DADDY && MODE == 3) global_max = fs3_m;
+    // When top-P partially retains the maximum's tie bucket, its bias also
+    // changes p_max. No lower bucket is retained in that case.
+    float max_bias = 0.0f;
+    if constexpr (DADDY && MODE == 3)
+        if (fs3_pb == 0 && fs3_ps == 0) max_bias = fs3_pbias;
+    ValIdx bin_best[8];
+    float bin_mass[8];
+    int candidate_bin = -1;
+    if constexpr (DADDY)
+    {
+        #pragma unroll
+        for (int b = 0; b < 8; ++b)
+        {
+            bin_best[b] = {FS_NEG_INF, INT_MAX};
+            bin_mass[b] = 0.0f;
+        }
+    }
     ValIdx best = { FS_NEG_INF, INT_MAX };
     for (int i = blockIdx.x * FS_THREADS + threadIdx.x; i < size; i += num_blocks * FS_THREADS)
     {
@@ -760,6 +818,9 @@ void fs_partial_argmax_kernel
         x = fs_mask(x, row_mask, row_bits, i);
 
         float v;
+        float bias = 0.0f;
+        if constexpr (DADDY)
+            if (!isfinite(x)) continue;
         if constexpr (MODE == 0)
         {
             v = x;
@@ -767,7 +828,6 @@ void fs_partial_argmax_kernel
         else
         {
             if (MODE >= 2 && x < threshold) continue;
-            float bias = 0.0f;
             if (MODE == 3)
             {
                 int b = 0, s = 0;
@@ -787,22 +847,60 @@ void fs_partial_argmax_kernel
             curand_init(random, (uint64_t) row * dim + i, 0, &rng);
             v = x * inv_temp + fs_gumbel(curand_uniform(&rng)) + bias;
         }
-        fs_amax_first(best, v, i);
+        if constexpr (DADDY)
+        {
+            float relative = (x - global_max) * inv_temp + bias - max_bias;
+            int b = daddy_bin(relative);
+            float mass = __expf(relative);
+            // Static indexing keeps the eight accumulators in registers instead
+            // of forcing dynamically indexed per-thread arrays into local memory.
+            #pragma unroll
+            for (int j = 0; j < 8; ++j)
+                if (b == j)
+                {
+                    bin_mass[j] += mass;
+                    fs_amax_first(bin_best[j], v, i);
+                }
+            if (draft && (int64_t) i == draft[row]) candidate_bin = b;
+        }
+        else fs_amax_first(best, v, i);
     }
 
-    best = fs_block_reduce_argmax_first(best);
-    if (threadIdx.x == 0)
-        ws_vi[row * num_blocks + blockIdx.x] = best;
+    if constexpr (DADDY)
+    {
+        DaddyPartial* part = daddy_ws + row * num_blocks + blockIdx.x;
+        #pragma unroll
+        for (int b = 0; b < 8; ++b)
+        {
+            ValIdx winner = fs_block_reduce_argmax_first(bin_best[b]);
+            if (threadIdx.x == 0) part->winner[b] = winner;
+            __syncthreads();
+            float mass = daddy_block_sum(bin_mass[b]);
+            if (threadIdx.x == 0) part->mass[b] = mass;
+            __syncthreads();
+        }
+        float cb = fs_block_reduce_max((float) candidate_bin);
+        if (threadIdx.x == 0) part->candidate_bin = (int) cb;
+    }
+    else
+    {
+        best = fs_block_reduce_argmax_first(best);
+        if (threadIdx.x == 0) ws_vi[row * num_blocks + blockIdx.x] = best;
+    }
 }
 
 // Pass 3: reduce the per-block winners to one token index per row
 
+template <bool DADDY_GREEDY = false>
 __global__ __launch_bounds__(FUSED_SAMPLER_MAX_BLOCKS)
 void fs_finalize_kernel
 (
     const ValIdx* __restrict__ ws_vi,           // (bsz, num_blocks)
     uint64_t* __restrict__ out,                 // (bsz, 1)
-    const int num_blocks
+    const int num_blocks,
+    const int64_t* draft = nullptr,
+    int64_t* counts = nullptr,
+    const double* balances = nullptr
 )
 {
     int row = blockIdx.x;
@@ -822,13 +920,98 @@ void fs_finalize_kernel
         v = lane_id < FUSED_SAMPLER_MAX_BLOCKS / 32 ? shared[lane_id] : ValIdx{ FS_NEG_INF, INT_MAX };
         v = fs_warp_reduce_argmax_first(v);
         if (lane_id == 0)
+        {
             out[row] = v.idx == INT_MAX ? 0 : (uint64_t) v.idx;
+            if constexpr (DADDY_GREEDY)
+            {
+                int64_t* c = counts + row * DADDY_SAMPLER_COUNTS;
+                if (draft && draft[row] == (int64_t) out[row] && balances[row * 8 + 7] + 1.0 > 0.0) ++c[0];
+                else
+                {
+                    if (draft) ++c[1];
+                    if (balances[row * 8 + 7] + 1.0 <= 0.0) ++c[2];
+                }
+            }
+        }
     }
+}
+
+// One thread per bin reduces at most 128 partials, then thread zero makes the
+// decision. All paths update the same balances and return one buffered token.
+__global__ void daddy_finalize_kernel(
+    const DaddyPartial* partials, int64_t* out, double* balances, int64_t* counts,
+    const int64_t* draft, int num_blocks, uint32_t random)
+{
+    int row = blockIdx.x, t = threadIdx.x;
+    __shared__ ValIdx winners[8];
+    __shared__ double masses[8];
+    __shared__ int candidate_bins[8];
+    if (t < 8)
+    {
+        ValIdx winner = {FS_NEG_INF, INT_MAX};
+        double mass = 0.0;
+        int cb = -1;
+        for (int j = 0; j < num_blocks; ++j)
+        {
+            const DaddyPartial& part = partials[row * num_blocks + j];
+            fs_amax_first(winner, part.winner[t].val, part.winner[t].idx);
+            mass += (double) part.mass[t];
+            cb = max(cb, part.candidate_bin);
+        }
+        winners[t] = winner;
+        masses[t] = mass;
+        candidate_bins[t] = cb;
+    }
+    __syncthreads();
+    if (t != 0) return;
+    double total = 0.0;
+    for (int b = 0; b < 8; ++b) total += masses[b];
+    // Empty eligible sets follow the ordinary fused sampler's token-zero convention.
+    if (!(total > 0.0)) { out[row] = 0; return; }
+    double* balance = balances + row * 8;
+    int64_t* c = counts + row * DADDY_SAMPLER_COUNTS;
+    int present = 0, only_bin = -1;
+    for (int b = 0; b < 8; ++b)
+        if (winners[b].idx != INT_MAX) { ++present; only_bin = b; }
+    // Gain one and spend one in the same bin must be exactly neutral, even
+    // after a long generation has accumulated non-dyadic double balances.
+    double previous = present == 1 ? balance[only_bin] : 0.0;
+    for (int b = 0; b < 8; ++b) balance[b] += masses[b] / total;
+    int cb = candidate_bins[0];
+    int selected = -1;
+    int64_t token;
+    if (draft && cb >= 0 && balance[cb] > 0.0)
+    {
+        selected = cb;
+        token = draft[row];
+        ++c[0];
+    }
+    else
+    {
+        if (draft) ++c[1];
+        // Favor low-probability bins on three out of four fallback draws,
+        // preserving higher-bin credit for later proposals and longer speculative runs.
+        bool high_first = (random & 3u) == 0;
+        int least_full = -1;
+        for (int k = 0; k < 8; ++k)
+        {
+            int b = high_first ? 7 - k : k;
+            if (winners[b].idx == INT_MAX) continue;
+            if (least_full < 0 || balance[b] > balance[least_full]) least_full = b;
+            if (balance[b] > 0.0) { selected = b; break; }
+        }
+        if (selected < 0) { selected = least_full; ++c[2]; }
+        token = winners[selected].idx;
+    }
+    if (present == 1) balance[selected] = previous;
+    else balance[selected] -= 1.0;
+    out[row] = token;
 }
 
 }  // namespace
 
-void fused_sampler
+template <bool DADDY>
+void fused_sampler_impl
 (
     const at::Tensor& logits,                   // (bsz, dim), half or float
     const c10::optional<at::Tensor>& logit_mask,// (1 or bsz, >= size), half, optional
@@ -848,7 +1031,12 @@ void fused_sampler
     float top_p,                                // mode 3
     float inv_temp_filter,                      // mode 3: 1 / T for filters computed on the
                                                 // tempered distribution, 1 otherwise
-    const c10::optional<at::Tensor>& histogram  // mode 3: >= bsz * FUSED_SAMPLER_HIST_STRIDE, u8
+    const c10::optional<at::Tensor>& histogram,
+    const c10::optional<at::Tensor>& daddy_workspace = c10::nullopt,
+    const c10::optional<at::Tensor>& balances = c10::nullopt,
+    const c10::optional<at::Tensor>& counts = c10::nullopt,
+    const c10::optional<at::Tensor>& draft = c10::nullopt,
+    uint32_t modulo = 4
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(logits.device());
@@ -919,6 +1107,31 @@ void fused_sampler
         TORCH_CHECK(((uintptr_t) hist_ptr) % 8 == 0, "fused_sampler: histogram must be 8-byte aligned");
     }
 
+    DaddyPartial* daddy_ptr = nullptr;
+    const int64_t* draft_ptr = nullptr;
+    if constexpr (DADDY)
+    {
+        // Keep the native call signature compatible, but reject policy changes.
+        TORCH_CHECK(modulo == 4, "DADDy fallback modulo is fixed at 4");
+        auto check = [&](const at::Tensor& tensor, at::ScalarType dtype, int64_t elements, const char* name)
+        {
+            TORCH_CHECK(tensor.scalar_type() == dtype && tensor.is_contiguous() &&
+                tensor.device() == logits.device() && tensor.numel() >= elements,
+                "daddy_sampler: invalid ", name);
+        };
+        check(daddy_workspace.value(), at::kFloat, (int64_t) bsz * num_blocks * DADDY_SAMPLER_PARTIAL_FLOATS, "workspace");
+        check(balances.value(), at::kDouble, (int64_t) bsz * 8, "balances");
+        check(counts.value(), at::kLong, (int64_t) bsz * DADDY_SAMPLER_COUNTS, "counts");
+        check(out, at::kLong, bsz, "output");
+        check(workspace, at::kFloat, (int64_t) bsz * FUSED_SAMPLER_MAX_BLOCKS * 3, "sampling workspace");
+        daddy_ptr = (DaddyPartial*) daddy_workspace.value().data_ptr();
+        if (draft.has_value())
+        {
+            check(draft.value(), at::kLong, bsz, "speculative tokens");
+            TORCH_CHECK(draft.value().numel() == bsz, "daddy_sampler: speculative batch mismatch");
+            draft_ptr = (const int64_t*) draft.value().data_ptr();
+        }
+    }
     if (!bsz) return;
     if (hist_ptr) cuda_check(cudaMemsetAsync(hist_ptr, 0, (size_t) bsz * FUSED_SAMPLER_HIST_STRIDE, stream));
 
@@ -926,9 +1139,9 @@ void fused_sampler
 
     #define FS_ARGS(T) \
         (const T*) logits.data_ptr(), mask_ptr, bits_ptr, ws_max, ws_vi, hist_ptr, dim, size, num_blocks, \
-        mask_per_row, bits_words, inv_temp, minp_log, filters, inv_temp_filter, random
+        mask_per_row, bits_words, inv_temp, minp_log, filters, inv_temp_filter, random, daddy_ptr, draft_ptr
 
-    if (mode >= 2)
+    if (mode >= 2 || (DADDY && mode == 1))
     {
         if (is_half)
             fs_partial_max_kernel<half><<<grid, FS_THREADS, 0, stream>>>
@@ -970,7 +1183,7 @@ void fused_sampler
     }
 
     #define FS_LAUNCH(T, MODE) \
-        fs_partial_argmax_kernel<T, MODE><<<grid, FS_THREADS, 0, stream>>>(FS_ARGS(T));
+        fs_partial_argmax_kernel<T, MODE, DADDY && MODE != 0><<<grid, FS_THREADS, 0, stream>>>(FS_ARGS(T));
     if (is_half)
     {
         if      (mode == 0) FS_LAUNCH(half, 0)
@@ -988,12 +1201,26 @@ void fused_sampler
     #undef FS_LAUNCH
     #undef FS_ARGS
 
-    fs_finalize_kernel<<<bsz, FUSED_SAMPLER_MAX_BLOCKS, 0, stream>>>
-    (
-        ws_vi,
-        (uint64_t*) out.data_ptr(),
-        num_blocks
-    );
+    if constexpr (DADDY)
+    {
+        if (mode == 0)
+        {
+            fs_finalize_kernel<true><<<bsz, FUSED_SAMPLER_MAX_BLOCKS, 0, stream>>>(
+                ws_vi, (uint64_t*) out.data_ptr(), num_blocks, draft_ptr,
+                (int64_t*) counts.value().data_ptr(), (const double*) balances.value().data_ptr());
+        }
+        else
+        {
+            daddy_finalize_kernel<<<bsz, 32, 0, stream>>>(daddy_ptr, (int64_t*) out.data_ptr(),
+                (double*) balances.value().data_ptr(), (int64_t*) counts.value().data_ptr(),
+                draft_ptr, num_blocks, random);
+        }
+    }
+    else
+    {
+        fs_finalize_kernel<<<bsz, FUSED_SAMPLER_MAX_BLOCKS, 0, stream>>>(
+            ws_vi, (uint64_t*) out.data_ptr(), num_blocks);
+    }
 
     cuda_check(cudaPeekAtLastError());
 }
@@ -1082,4 +1309,53 @@ void apply_logit_bitmask
         );
 
     cuda_check(cudaPeekAtLastError());
+}
+
+void fused_sampler
+(
+    const at::Tensor& logits,
+    const c10::optional<at::Tensor>& logit_mask,
+    const c10::optional<at::Tensor>& logit_bitmask,
+    at::Tensor& out,
+    at::Tensor& workspace,
+    int size,
+    float inv_temp,
+    float minp_log,
+    uint32_t random,
+    int mode,
+    int filters,
+    int top_k,
+    float top_p,
+    float inv_temp_filter,
+    const c10::optional<at::Tensor>& histogram
+)
+{
+    fused_sampler_impl<false>(logits, logit_mask, logit_bitmask, out, workspace, size, inv_temp, minp_log, random, mode, filters, top_k, top_p, inv_temp_filter, histogram);
+}
+
+void daddy_sampler
+(
+    const at::Tensor& logits,
+    const c10::optional<at::Tensor>& logit_mask,
+    const c10::optional<at::Tensor>& logit_bitmask,
+    at::Tensor& out,
+    at::Tensor& workspace,
+    int size,
+    float inv_temp,
+    float minp_log,
+    uint32_t random,
+    int mode,
+    int filters,
+    int top_k,
+    float top_p,
+    float inv_temp_filter,
+    const c10::optional<at::Tensor>& histogram,
+    const at::Tensor& daddy_workspace,
+    const at::Tensor& balances,
+    const at::Tensor& counts,
+    const c10::optional<at::Tensor>& draft,
+    uint32_t modulo
+)
+{
+    fused_sampler_impl<true>(logits, logit_mask, logit_bitmask, out, workspace, size, inv_temp, minp_log, random, mode, filters, top_k, top_p, inv_temp_filter, histogram, daddy_workspace, balances, counts, draft, modulo);
 }

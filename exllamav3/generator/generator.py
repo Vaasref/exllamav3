@@ -324,6 +324,7 @@ class Generator:
 
         # Pinned staging buffer for batched token readback in iterate_gen
         self.sample_pinned = None
+        self.daddy_draft_buffer = None
         self.staging_buffers = {}
         self.stage_arenas = {}
         self.stage_devices = None
@@ -864,6 +865,7 @@ class Generator:
             self.cpu_page_cache = None
             self.pagetable.cpu_tier = None
         self.sample_pinned = None
+        self.daddy_draft_buffer = None
         self.staging_buffers = {}
         self.stage_arenas = {}
         self.draft_input_ids_pinned = None
@@ -1845,6 +1847,7 @@ class Generator:
         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
         # must advance between positions.
         else:
+            daddy_proposals = None
             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
                 if a == b: continue
                 job_logits = batch_logits[a:b, :, :]
@@ -1866,6 +1869,7 @@ class Generator:
                 batchable = (
                     not _NO_BATCH_READBACK
                     and b - a == 1
+                    and job.daddy_state is None  # State must advance only for consumed positions.
                     and job.checkpoint is None
                     and job.forced_ids is None
                     and job.new_tokens >= job.min_new_tokens
@@ -1900,9 +1904,27 @@ class Generator:
                     if staged is not None:
                         (next_token, next_k_tokens, next_k_probs, next_prob), _ = staged[i]
                     else:
-                        next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
-                            token_logits,
-                        )
+                        if job.daddy_state is not None:
+                            proposal = None
+                            if draft_tokens is not None and i < W - 1:
+                                if daddy_proposals is None:
+                                    # Upload the draft window once, reusing device storage.
+                                    if draft_tokens.device == batch_logits.device:
+                                        daddy_proposals = draft_tokens
+                                    else:
+                                        buf = self.daddy_draft_buffer
+                                        rows, cols = draft_tokens.shape
+                                        if (buf is None or buf.device != batch_logits.device or
+                                            buf.shape[0] < rows or buf.shape[1] < cols):
+                                            self.daddy_draft_buffer = buf = torch.empty(
+                                                (rows, cols), dtype=torch.long, device=batch_logits.device)
+                                        daddy_proposals = buf[:rows, :cols]
+                                        daddy_proposals.copy_(draft_tokens, non_blocking=draft_tokens.is_pinned())
+                                proposal = daddy_proposals[j:j + 1, i:i + 1].reshape(1)
+                            sampled = job.receive_logits(token_logits, speculative_token=proposal)
+                        else:
+                            sampled = job.receive_logits(token_logits)
+                        next_token, next_k_tokens, next_k_probs, next_prob = sampled
                     eos, sampled_token, rq = job.receive_sample(
                         token_logits,
                         next_token,

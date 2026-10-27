@@ -11,7 +11,7 @@ import random
 import time
 from ..ext import exllamav3_ext as ext
 from .loop_detect import LoopDetector
-from .sampler import Sampler, DefaultSampler
+from .sampler import Sampler, DefaultSampler, DADDySampler
 from ..util.tensor import SeqTensor
 from ..tokenizer import MMEmbedding
 from functools import lru_cache
@@ -224,6 +224,9 @@ class Job:
         self.min_new_tokens = min_new_tokens
         self.new_tokens = 0 if self.prefix_token is None else -1
         self.sampler = sampler
+        self.daddy_state = rq_state.get("daddy_state")
+        if self.daddy_state is None and isinstance(sampler, DADDySampler):
+            self.daddy_state = sampler.new_generation()
         self.rng = rq_state.get("rng")
         if self.rng is None:
             self.rng = random.Random() if seed is None else random.Random(seed)
@@ -557,7 +560,12 @@ class Job:
         :param sampler:
             New sampler, or None for the default sampler.
         """
+        # A held checkpoint belongs to the old sampler's state and cannot be
+        # replayed after replacing its policy. Release it as set_filters does.
+        if self.checkpoint is not None and (self.daddy_state is not None or isinstance(sampler, DADDySampler)):
+            self._release_banned_hold()
         self.sampler = sampler if sampler is not None else DefaultSampler()
+        self.daddy_state = self.sampler.new_generation() if isinstance(self.sampler, DADDySampler) else None
 
 
     def set_filters(self, filters: list[Filter] | None):
@@ -729,6 +737,7 @@ class Job:
     def receive_logits(
         self,
         logits: torch.Tensor,
+        speculative_token: torch.Tensor | None = None,
     ):
         # TODO: (cfg)
         # assert logits.shape[0] == len(self.sequences) == (2 if self.gen_settings.cfg_scale is not None else 1)
@@ -751,7 +760,20 @@ class Job:
 
         # A pending forced token (constrain_output_now) replaces the sampler's choice; everything
         # downstream treats it as a regular sample. Token healing (new_tokens == -1) resolves first
-        if self.forced_ids is not None and self.new_tokens >= 0:
+        if self.daddy_state is not None:
+            self.daddy_state.prepare(logits.device, 1)
+            if self.banned_strings:
+                self.daddy_state.save_before_step()
+            forced_token = None
+            if self.forced_ids is not None and self.new_tokens >= 0:
+                forced_token = self._pop_forced_token(logits.device)
+            next_token = self.sampler.forward(
+                logits, self.current_device_ids, self.rng.randint(0, (1<<32)-1),
+                self.generator.tokenizer, logit_mask=self.device_logit_mask,
+                generation_state=self.daddy_state, speculative_token=speculative_token,
+                forced_token=forced_token,
+            )
+        elif self.forced_ids is not None and self.new_tokens >= 0:
             next_token = self._pop_forced_token(logits.device)
         else:
             next_token = self.sampler.forward(
@@ -1023,6 +1045,7 @@ class Job:
         def set_checkpoint():
             if self.checkpoint is None:
                 self.checkpoint = {
+                    "daddy_snapshot": self.daddy_state.checkpoint() if self.daddy_state is not None else None,
                     "offset": 1,
                     "held_text": held_text_before,   # not held_text[:-len(new_text)]: new_text may be empty
                     "held_tokens": self.held_tokens.clone(1),
@@ -1044,6 +1067,8 @@ class Job:
         def rewind_checkpoint():
             assert self.checkpoint is not None
             offset = self.checkpoint["offset"]
+            if self.daddy_state is not None:
+                self.daddy_state.restore(self.checkpoint["daddy_snapshot"])
             self.new_tokens -= offset
 
             # Roll back filter state over the rewound tokens (every token counted in the offset was
@@ -1207,6 +1232,7 @@ class Job:
         new_input = seq.sequence_ids.torch()
 
         rq_state = {
+            "daddy_state": self.daddy_state,
             "rng": self.rng,
             "stop_strings": self.stop_strings,
             "stop_tokens": self.stop_tokens,

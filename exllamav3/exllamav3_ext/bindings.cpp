@@ -282,6 +282,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gumbel_noise_f16", &gumbel_noise_f16, "gumbel_noise_f16");
     m.def("gumbel_noise_f32", &gumbel_noise_f32, "gumbel_noise_f32");
     m.def("gumbel_noise_log", &gumbel_noise_log, "gumbel_noise_log");
+    m.def("daddy_sampler", &daddy_sampler, "daddy_sampler");
+    m.attr("DADDY_SAMPLER_PARTIAL_FLOATS") = DADDY_SAMPLER_PARTIAL_FLOATS;
+    m.attr("DADDY_SAMPLER_COUNTS") = DADDY_SAMPLER_COUNTS;
     m.def("fused_sampler", &fused_sampler, "fused_sampler");
     m.def("apply_logit_bitmask", &apply_logit_bitmask, "apply_logit_bitmask");
     m.attr("FUSED_SAMPLER_MAX_BLOCKS") = FUSED_SAMPLER_MAX_BLOCKS;
