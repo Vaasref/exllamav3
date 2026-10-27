@@ -1,6 +1,6 @@
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from exllamav3 import Generator, Job, model_init, GreedySampler, TopPSampler
+from exllamav3 import Generator, Job, model_init, GreedySampler, TopPSampler, DADDySampler
 import argparse
 import torch
 import json
@@ -187,6 +187,8 @@ def print_stats(stats_sink):
 def main(args):
     if args.ngram_corpus and args.s_ngram_match_min <= 0:
         raise ValueError("-ngram_corpus requires -ngram_min > 0")
+    sampler = DADDySampler(TopPSampler(0.9, 1)) if args.daddy else GreedySampler()
+    sampling_mode = "DADDy, top-p 0.9, temp 1" if args.daddy else "greedy"
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(
         args,
         min_draft_len = args.s_ngram_draft_length
@@ -212,7 +214,7 @@ def main(args):
             tokenizer = tokenizer,
             max_chunk_size = args.chunk_size,
         )
-        result_baseline = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens)
+        result_baseline = measure(generator, tokenizer, sampler, args.max_new_tokens)
 
     # N-gram draft
     result_ngram = None
@@ -231,8 +233,8 @@ def main(args):
             record_draft_stats = stats_sink is not None,
             max_chunk_size = args.chunk_size,
         )
-        result_ngram = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens, stats_sink)
-        if args.temperature:
+        result_ngram = measure(generator, tokenizer, sampler, args.max_new_tokens, stats_sink)
+        if args.temperature and not args.daddy:
             result_ngram_temp = measure(generator, tokenizer, TopPSampler(0.9, 1), args.max_new_tokens)
 
     # SD with draft model
@@ -253,13 +255,13 @@ def main(args):
             record_draft_stats = stats_sink is not None,
             max_chunk_size = args.chunk_size,
         )
-        result_draft = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens, stats_sink)
+        result_draft = measure(generator, tokenizer, sampler, args.max_new_tokens, stats_sink)
         if generator.sparse_head is not None:
             st = generator.sparse_head.stats()
             print(f" -- sparse draft head: {st['active']} columns, mode sparse {st['mode_sparse']} ({st['mode_switches']} switches), "
                   f"miss rate {st['miss_rate'] * 100:.2f}% (break-even {(st['breakeven_miss_rate'] or 0) * 100:.2f}%), "
                   f"rounds {st['rounds']}, probes {st['probes']} ({st['probe_disagree_inside']} inside / {st['probe_disagree_outside']} outside)")
-        if args.temperature:
+        if args.temperature and not args.daddy:
             result_draft_temp = measure(generator, tokenizer, TopPSampler(0.9, 1), args.max_new_tokens)
 
     # Print results
@@ -272,9 +274,9 @@ def main(args):
         draft_mode += f" + hybrid {args.hybrid_draft_tokens}"
     r = {
         "Baseline": result_baseline,
-        "N-gram (greedy)": result_ngram,
+        f"N-gram ({sampling_mode})": result_ngram,
         "N-gram (temp 1)": result_ngram_temp,
-        f"{draft_mode} (greedy)": result_draft,
+        f"{draft_mode} ({sampling_mode})": result_draft,
         f"{draft_mode} (temp 1)": result_draft_temp,
     }
     r = {k: v for k, v in r.items() if v is not None}
@@ -347,6 +349,7 @@ if __name__ == "__main__":
     parser.add_argument("-ngram_len", "--s_ngram_draft_length", type = int, help = "N-gram draft length, default = 4", default = 4)
     parser.add_argument("-tokens", "--max_new_tokens", type = int, help = "Max sampled tokens per round", default = 1024)
     parser.add_argument("-temp", "--temperature", action = "store_true", help = "Also sample with temperature")
+    parser.add_argument("--daddy", action = "store_true", help = "Use DADDy with top-p 0.9 and temperature 1 for baseline and speculative runs (includes -temp)")
     parser.add_argument("-single", "--single_workload", type = str, help = "Limit to single workload", default = None)
     parser.add_argument("-dstats", "--draft_stats", type = str, help = "Write per-round (position, window, accepted) records to JSON file", default = None)
     parser.add_argument("-plot", "--plot_stats", action = "store_true", help = "Plot per-round draft stats in a matplotlib window after the run")
