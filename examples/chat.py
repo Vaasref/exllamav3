@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 import tempfile
 import webbrowser
-from exllamav3 import Generator, Job, model_init
+from exllamav3 import Generator, Job, DADDySampler, model_init
 from exllamav3.constants import PAGE_SIZE
 from chat_templates import *
 from chat_util import *
@@ -67,6 +67,11 @@ def main(args):
         read_input_fn = read_input_ptk
         streamer_cm = Streamer_rich
 
+    # Sampler (validate the selected pipeline before loading the model)
+    sampler = model_init.get_arg_sampler(args)
+    if args.daddy:
+        sampler = DADDySampler(sampler)
+
     # Load model
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
     context_length = cache.max_num_tokens
@@ -105,9 +110,6 @@ def main(args):
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
     if config.eos_token_id_list and all(config.eos_token_id_list):
         stop_conditions += config.eos_token_id_list
-
-    # Sampler
-    sampler = model_init.get_arg_sampler(args)
 
     # Single prompt mode
     single_prompt = args.prompt
@@ -670,5 +672,9 @@ if __name__ == "__main__":
     parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     parser.add_argument("-gcs", "--generator_chunk_size", type = int, default = 2048, help = "Maximum prompt-prefill chunk size, default = 2048")
+    parser.add_argument("--daddy", action = "store_true", help = "Use stateful DADDy bin sampling with the selected sampling settings")
+    # Accept existing launch scripts while the sampling policy stays fixed at four.
+    parser.add_argument("--speculative_fallback_modulo", "--speculative-fallback-modulo",
+                        type = int, choices = (4,), help = argparse.SUPPRESS)
     _args = parser.parse_args()
     main(_args)
