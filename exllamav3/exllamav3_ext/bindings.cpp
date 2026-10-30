@@ -284,6 +284,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gumbel_noise_log", &gumbel_noise_log, "gumbel_noise_log");
     m.def("daddy_sampler", &daddy_sampler, "daddy_sampler");
     m.attr("DADDY_SAMPLER_PARTIAL_FLOATS") = DADDY_SAMPLER_PARTIAL_FLOATS;
+    m.attr("DADDY_SAMPLER_API_VERSION") = DADDY_SAMPLER_API_VERSION;
     m.attr("DADDY_SAMPLER_COUNTS") = DADDY_SAMPLER_COUNTS;
     m.def("fused_sampler", &fused_sampler, "fused_sampler");
     m.def("apply_logit_bitmask", &apply_logit_bitmask, "apply_logit_bitmask");

@@ -7,7 +7,7 @@ import torch
 from exllamav3 import Job, DADDySampler, CategoricalSampler, CustomSampler, SS_Sample_mn
 from exllamav3.generator.sampler.daddy import DADDyState
 from exllamav3.ext import exllamav3_ext as ext
-from testlib.daddy import BOUNDARIES, distribution, step
+from testlib.daddy import BOUNDARIES, distribution, step, fallback_weights
 from testlib.sampling import element_noise
 
 pytestmark = pytest.mark.nogpu
@@ -17,10 +17,10 @@ pytestmark = pytest.mark.nogpu
 def cpu_kernel(monkeypatch):
     calls = []
     monkeypatch.setattr(ext, 'DADDY_SAMPLER_COUNTS', 3, raising=False)
+    monkeypatch.setattr(ext, 'DADDY_SAMPLER_API_VERSION', 2, raising=False)
     monkeypatch.setattr(ext, 'DADDY_SAMPLER_PARTIAL_FLOATS', 26, raising=False)
     def run(logits, mask, bits, out, ws, size, inv_temp, minp_log, seed, mode,
-            filters, top_k, top_p, inv_temp_filter, hist, dws, balances, counts, proposal, modulo):
-        assert modulo == 4
+            filters, top_k, top_p, inv_temp_filter, hist, dws, balances, counts, proposal, overdraft, boost, fixed_repulsor, dynamic_repulsor):
         calls.append(None if proposal is None else proposal.clone())
         for row, tensor in enumerate(logits):
             x = tensor.double().numpy().copy()
@@ -38,7 +38,8 @@ def cpu_kernel(monkeypatch):
             _, noise = element_noise(seed, logits.numel())
             candidate = None if proposal is None else int(proposal[row])
             token, info = step(probs, balances[row].numpy(), seed, candidate,
-                               noise=noise.reshape(logits.shape)[row])
+                               noise=noise.reshape(logits.shape)[row], overdraft=overdraft, boost=boost,
+                               fixed_repulsor=fixed_repulsor, dynamic_repulsor=dynamic_repulsor)
             out[row, 0] = token
             if info['bin'] is not None:
                 counts[row, 0] += int(info['path'] == 'proposal')
@@ -55,12 +56,13 @@ def test_boundary_convention():
     assert np.searchsorted(BOUNDARIES, p / p.max(), side='right').tolist() == list(range(1, 8)) + [7]
 
 
-def test_direction_and_first_step():
+def test_first_step_matches_categorical():
     p = np.array([.02, .08, .9])
     for seed in range(16):
         balance = np.zeros(8)
         token, info = step(p, balance, seed)
-        assert token == (2 if seed % 4 == 0 else 0)
+        _, noise = element_noise(seed, len(p))
+        assert token == np.argmax(np.log(p) + noise)
         assert abs(balance.sum()) < 1e-14
         assert info['path'] == 'draw'
 
@@ -74,7 +76,7 @@ def test_singleton_never_changes_balances():
     np.testing.assert_array_equal(balance, original)
 
 
-def test_changing_distribution_all_full_and_tie_direction():
+def test_changing_distribution_all_full_and_equal_bin_ties():
     # Empty intermediate bins retain positive credit; currently present bins have debt.
     p = np.r_[np.full(64, 1/128), .5]
     for seed in [0, 1]:
@@ -83,11 +85,14 @@ def test_changing_distribution_all_full_and_tie_direction():
         token, info = step(p, b, seed)
         assert info['path'] == 'all_full'
         assert token == 64  # -.1 in bin 7 is larger than -.3 in bin 0
-    for seed, expected in [(0, 64), (1, 0)]:
+    # Equal-score bins receive equal total weight, despite very different token counts.
+    selected = []
+    for seed in range(1000):
         b = np.zeros(8)
         b[[0, 3, 7]] = [-.75, 1.5, -.75]
-        token, info = step(p, b, seed, noise=np.zeros(65))
-        assert token == expected
+        _, info = step(p, b, seed)
+        selected.append(info['bin'])
+    assert .45 < np.mean(np.array(selected) == 7) < .55
 
 
 def test_proposal_is_taken_by_bin_without_reference_token_equality():
@@ -288,3 +293,107 @@ def test_missing_or_outdated_native_extension_has_actionable_error(monkeypatch, 
         monkeypatch.delattr(ext, 'daddy_sampler', raising=False)
     with pytest.raises(RuntimeError, match='rebuilding the native'):
         DADDyState().prepare(torch.device('cpu'), 1)
+
+
+@pytest.mark.parametrize('overdraft', [0., .125, .5, 1., 2., 5.])
+def test_fractional_overdraft_configuration_and_reset(cpu_kernel, overdraft):
+    sampler = DADDySampler(CategoricalSampler(), overdraft=overdraft)
+    other = sampler.new_generation()
+    assert other is not sampler.state
+    assert other.overdraft == sampler.state.overdraft == overdraft
+    sampler.reset()
+    assert sampler.state.overdraft == overdraft
+    # Proposal bin has -0.25 credit after earning the current mass.
+    sampler.state.prepare(torch.device('cpu'), 1)
+    sampler.state.balances[0, 0] = -.26
+    sampler.state.balances[0, 7] = .26
+    sampler.forward(torch.log(torch.tensor([[.01, .99]])), rand_u32=5,
+                    speculative_token=torch.tensor([0]))
+    assert sampler.state.stats()[0]['direct_proposals'] == int(overdraft > .25)
+
+
+@pytest.mark.parametrize('overdraft', [-.1, 5.0001, float('inf'), -float('inf'), float('nan')])
+def test_invalid_overdraft(overdraft):
+    with pytest.raises(ValueError, match='overdraft must be finite'):
+        DADDySampler(overdraft=overdraft)
+
+
+def test_stale_api_version_requires_rebuild(monkeypatch):
+    monkeypatch.setattr(ext, 'daddy_sampler', lambda *args: None, raising=False)
+    monkeypatch.setattr(ext, 'DADDY_SAMPLER_COUNTS', 3, raising=False)
+    monkeypatch.setattr(ext, 'DADDY_SAMPLER_API_VERSION', 1, raising=False)
+    with pytest.raises(RuntimeError, match='rebuilding the native'):
+        DADDyState().prepare(torch.device('cpu'), 1)
+
+
+def test_exact_overdraft_threshold_is_closed():
+    # Dyadic probabilities and balances make equality exact.
+    p = [1/64, 63/64]
+    balances = np.zeros(8)
+    balances[[0, 7]] = [-.5 - 1/64, .5 + 1/64]
+    _, info = step(p, balances, 0, proposal=0, overdraft=.5)
+    assert info['path'] == 'draw' and info['bin'] == 7
+    balances[[0, 7]] = [-.5 - 1/64 + 1/1024, .5 + 1/64 - 1/1024]
+    _, info = step(p, balances, 0, proposal=0, overdraft=.5)
+    assert info['path'] == 'proposal'
+
+
+def test_bias_curve_bubbles_and_proposal_gating():
+    credit = np.array([.01, .02, .03, .04, .10, .20, .25, .35])
+    present = np.ones(8, dtype=bool)
+    ordinary, _ = fallback_weights(credit, present)
+    np.testing.assert_array_equal(ordinary, credit)
+    boosted = credit + .5 * np.minimum(credit, .125)
+    fixed = np.array([.875, .75, .5, .75, .875, 1., 1., 1.])
+    dynamic = np.array([1., 1., 1., .8125, .625, .25, .625, .8125])
+    actual, _ = fallback_weights(credit, present, 5, proposal_given=True)
+    np.testing.assert_allclose(actual, boosted * fixed * dynamic)
+    invalid, _ = fallback_weights(credit, present, proposal_given=True)
+    np.testing.assert_allclose(invalid, boosted * fixed)
+    disabled, _ = fallback_weights(credit, present, 5, proposal_given=True,
+                                   boost=0., fixed_repulsor=0., dynamic_repulsor=0.)
+    np.testing.assert_allclose(disabled, credit)
+
+
+def test_full_suppression_reverts_to_original_credit():
+    credit = np.zeros(8)
+    credit[2] = .4
+    weights, path = fallback_weights(credit, credit > 0, proposal_given=True, fixed_repulsor=1.)
+    np.testing.assert_array_equal(weights, credit)
+    assert path == 'draw'
+    # Both populated bins can be suppressed by different repulsors.
+    credit[7] = .6
+    weights, _ = fallback_weights(credit, credit > 0, 7, proposal_given=True,
+                                  fixed_repulsor=1., dynamic_repulsor=1.)
+    np.testing.assert_array_equal(weights, credit)
+
+
+def test_controlled_bin_weights_and_within_bin_distribution():
+    p = np.array([.01, .02, .04, .93])  # first two share bin zero
+    mass = np.zeros(8)
+    mass[[0, 1, 7]] = [.03, .04, .93]
+    target_credit = np.zeros(8)
+    target_credit[[0, 1, 7]] = [.2, .3, .5]
+    rng = np.random.default_rng(94)
+    counts = np.zeros(4)
+    for _ in range(12000):
+        token, _ = step(p, target_credit - mass, 0, noise=rng.gumbel(size=4))
+        counts[token] += 1
+    np.testing.assert_allclose(counts / counts.sum(), [.2/3, .4/3, .3, .5], atol=.015)
+
+
+@pytest.mark.parametrize('overdraft', [0., .5, 5.])
+def test_changing_distribution_accounting(overdraft):
+    rng = np.random.default_rng(19)
+    balances = np.zeros(8)
+    expected = np.zeros(8)
+    selections = np.zeros(8)
+    for turn in range(500):
+        p = rng.dirichlet(np.full(64, .3))
+        if turn % 7 == 0:
+            p[p < .02] = 0
+        _, info = step(p, balances, turn, proposal=turn % 64, overdraft=overdraft)
+        expected += info['mass']
+        selections[info['bin']] += 1
+        np.testing.assert_allclose(balances, expected - selections, atol=2e-12)
+        assert abs(balances.sum()) < 2e-12

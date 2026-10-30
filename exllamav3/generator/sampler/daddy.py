@@ -2,6 +2,7 @@
 
 Configuration can be shared; each generation must own its own DADDyState.
 """
+import math
 import torch
 from .sampler import Sampler
 from .custom import CustomSampler, SS_Fused
@@ -9,8 +10,23 @@ from .presets import DefaultSampler
 from ...ext import exllamav3_ext as ext
 
 
+# Internal heuristics: zero independently disables each bias. Only proposal
+# fallbacks use these; ordinary fallback draws use available credit directly.
+_SMALL_SHARE_BOOST = 0.5
+_FIXED_REPULSOR = 0.5
+_DYNAMIC_REPULSOR = 0.75
+
+
+def validate_overdraft(value):
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 5.0:
+        raise ValueError("DADDy overdraft must be finite and between 0 and 5")
+    return value
+
+
 class DADDyState:
-    def __init__(self):
+    def __init__(self, overdraft=0.0):
+        self.overdraft = validate_overdraft(overdraft)
         self.balances = None
         self.counts = None
         self.output = None
@@ -22,7 +38,8 @@ class DADDyState:
             if self.balances.device != device or self.balances.shape[0] != bsz:
                 raise ValueError("Reset DADDy state before changing device or batch size")
             return
-        if not hasattr(ext, "daddy_sampler") or getattr(ext, "DADDY_SAMPLER_COUNTS", None) != 3:
+        if (not hasattr(ext, "daddy_sampler") or getattr(ext, "DADDY_SAMPLER_COUNTS", None) != 3
+                or getattr(ext, "DADDY_SAMPLER_API_VERSION", None) != 2):
             raise RuntimeError("DADDy requires rebuilding the native exllamav3 extension")
         self.balances = torch.zeros((bsz, 8), dtype = torch.double, device = device)
         self.counts = torch.zeros((bsz, ext.DADDY_SAMPLER_COUNTS), dtype = torch.long, device = device)
@@ -40,7 +57,8 @@ class DADDyState:
             self.output, workspace, state.fused_dim or state.dim,
             fused.inv_temp, fused.minp_log, state.rand_u32, fused.mode, fused.filters,
             fused.top_k, fused.top_p, fused.inv_temp_filter, histogram,
-            self.workspace, self.balances, self.counts, state.speculative_token, 4,
+            self.workspace, self.balances, self.counts, state.speculative_token, self.overdraft,
+            _SMALL_SHARE_BOOST, _FIXED_REPULSOR, _DYNAMIC_REPULSOR,
         )
         return self.output
 
@@ -81,10 +99,12 @@ class DADDySampler(Sampler):
     calls use one persistent stream per batch row until reset() is called. The
     returned tensor is a reusable buffer, overwritten by the next call: clone
     it if it needs to outlive that call. No exact distribution preservation is
-    claimed by this heuristic policy.
+    claimed by this heuristic policy. ``overdraft`` is a finite float in [0, 5],
+    defaulting to zero; increasing it can substantially alter output quality.
     """
-    def __init__(self, sampler=None):
+    def __init__(self, sampler=None, *, overdraft=0.0):
         super().__init__()
+        self.overdraft = validate_overdraft(overdraft)
         self.sampler = sampler if sampler is not None else DefaultSampler()
         if (not isinstance(self.sampler, CustomSampler) or not self.sampler.steps or
             not isinstance(self.sampler.steps[-1], SS_Fused)):
@@ -94,7 +114,7 @@ class DADDySampler(Sampler):
         self.reset()
 
     def new_generation(self):
-        return DADDyState()
+        return DADDyState(self.overdraft)
 
     def reset(self):
         self.state = self.new_generation()

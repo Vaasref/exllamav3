@@ -8,12 +8,13 @@ from testlib.e2e import load_model
 pytestmark = [pytest.mark.model('dense'), pytest.mark.slow]
 
 
+@pytest.mark.parametrize('overdraft', [0., .5])
 @pytest.mark.parametrize('draft', [False, True])
-def test_one_call_and_budget_per_committed_position(model_registry, device, draft):
+def test_one_call_and_budget_per_committed_position(model_registry, device, draft, overdraft):
     with load_model(model_registry.get('dense').path, device) as lm:
         gen = lm.generator(ngram_match_min=2 if draft else 0, num_draft_tokens=4,
                            record_draft_stats=True)
-        sampler = DADDySampler(ComboSampler(top_k=32, temperature=.8))
+        sampler = DADDySampler(ComboSampler(top_k=32, temperature=.8), overdraft=overdraft)
         ids = lm.tokenizer.encode('One two three four. ' * 50, add_bos=True)
         job = Job(ids, max_new_tokens=48, stop_conditions=[], sampler=sampler, seed=123)
         with patch.object(sampler, 'forward', wraps=sampler.forward) as calls:

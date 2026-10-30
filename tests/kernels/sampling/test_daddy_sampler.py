@@ -9,7 +9,7 @@ from testlib.daddy import distribution, step
 from testlib.sampling import element_noise
 
 
-def invoke(logits, balances, counts, *, seed=0, modulo=4, proposal=None, mode=1,
+def invoke(logits, balances, counts, *, seed=0, overdraft=0., boost=.5, fixed_repulsor=.5, dynamic_repulsor=.75, proposal=None, mode=1,
            inv_temp=1., minp_log=0., filters=0, top_k=0, top_p=1., inv_temp_filter=1.,
            mask=None, bits=None, size=None, buffers=None):
     rows, dim = logits.shape
@@ -23,17 +23,19 @@ def invoke(logits, balances, counts, *, seed=0, modulo=4, proposal=None, mode=1,
     out, ws, hist, dws = buffers
     ext.daddy_sampler(logits, mask, bits, out, ws, size or dim, inv_temp, minp_log,
                       seed, mode, filters, top_k, top_p, inv_temp_filter,
-                      hist if mode == 3 else None, dws, balances, counts, proposal, modulo)
+                      hist if mode == 3 else None, dws, balances, counts, proposal,
+                      overdraft, boost, fixed_repulsor, dynamic_repulsor)
     return out, buffers
 
 
+@pytest.mark.parametrize('overdraft', [0., .5, 5.])
 @pytest.mark.parametrize('dtype', [torch.float16, torch.float32])
 @pytest.mark.parametrize('case', [
     dict(mode=1), dict(mode=2, minp_log=math.log(.08), inv_temp=1.25),
     dict(mode=3, filters=3, top_k=37, top_p=.83, inv_temp=.8),
     dict(mode=3, filters=7, top_k=51, top_p=.91, minp_log=math.log(.05), inv_temp=1.25, inv_temp_filter=1.25),
 ])
-def test_multiround_reference(device, dtype, case):
+def test_multiround_reference(device, dtype, case, overdraft):
     rows, dim = 3, 4097
     rng = np.random.default_rng(42)
     balances = torch.zeros(rows, 8, dtype=torch.double, device=device)
@@ -49,14 +51,14 @@ def test_multiround_reference(device, dtype, case):
         proposal = None if seed % 3 == 0 else torch.tensor(
             rng.integers(0, dim, rows), dtype=torch.long, device=device)
         out, buffers = invoke(logits, balances, counts, seed=seed,
-                              proposal=proposal, buffers=buffers, **case)
+                              proposal=proposal, buffers=buffers, overdraft=overdraft, **case)
         _, noise = element_noise(seed, rows * dim)
         expected = []
         for row in range(rows):
             probs = distribution(logits[row].float().cpu().numpy(), **case)
             token, info = step(probs, expected_balance[row], seed,
                                None if proposal is None else int(proposal[row]),
-                               noise=noise.reshape(rows, dim)[row])
+                               noise=noise.reshape(rows, dim)[row], overdraft=overdraft)
             expected.append(token)
             expected_counts[row, 0] += int(info['path'] == 'proposal')
             expected_counts[row, 1] += int(proposal is not None and info['path'] != 'proposal')
@@ -173,11 +175,91 @@ def test_topp_maximum_tie_bias_defines_pmax(device):
     assert stats['balances'] == [0.] * 8
 
 
-@pytest.mark.parametrize('modulo', [0, 1, 2, 8, 16])
-def test_native_modulo_is_fixed(device, modulo):
+@pytest.mark.parametrize('overdraft', [-.1, 5.1, float('nan'), float('inf')])
+def test_native_overdraft_validation(device, overdraft):
     logits = torch.zeros((1, 3), device=device)
     balances = torch.zeros((1, 8), dtype=torch.double, device=device)
     counts = torch.zeros((1, ext.DADDY_SAMPLER_COUNTS), dtype=torch.long, device=device)
-    with pytest.raises(RuntimeError, match='fixed at 4'):
-        invoke(logits, balances, counts, modulo=modulo)
+    with pytest.raises(RuntimeError, match='overdraft must be finite'):
+        invoke(logits, balances, counts, overdraft=overdraft)
     assert balances.count_nonzero() == 0 and counts.count_nonzero() == 0
+
+
+@pytest.mark.parametrize('overdraft', [0., .5, 5.])
+@pytest.mark.parametrize('proposal_id', [None, -1, 0, 3])
+@pytest.mark.parametrize('strengths', [(0., 0., 0.), (.5, .5, .75), (.5, 1., 1.)])
+def test_fused_weights_against_per_token_reference(device, overdraft, proposal_id, strengths):
+    # A low bin with two tokens verifies the within-bin distribution as well.
+    p = np.array([.01, .02, .10, .87])
+    x = torch.tensor(np.log(p)[None], dtype=torch.float32, device=device)
+    actual_p = distribution(x[0].cpu().numpy())
+    boost, fixed, dynamic = strengths
+    for seed in range(12):
+        original = np.zeros(8)
+        original[[0, 2, 7]] = [-.25, .75, -.5]
+        balance = torch.tensor(original[None], dtype=torch.double, device=device)
+        counts = torch.zeros(1, 3, dtype=torch.long, device=device)
+        proposal = None if proposal_id is None else torch.tensor([proposal_id], device=device)
+        out, _ = invoke(x, balance, counts, seed=seed, proposal=proposal, overdraft=overdraft,
+                        boost=boost, fixed_repulsor=fixed, dynamic_repulsor=dynamic)
+        token, info = step(actual_p, original, seed, proposal_id, overdraft=overdraft,
+                           boost=boost, fixed_repulsor=fixed, dynamic_repulsor=dynamic)
+        assert out.item() == token
+        np.testing.assert_allclose(balance.cpu()[0], original, atol=1e-7)
+        assert counts[0, 0].item() == (info['path'] == 'proposal')
+
+
+def test_native_all_suppressed_and_threshold(device):
+    p = np.array([1/8, 7/8])  # bins 2 and 7
+    x = torch.tensor(np.log(p)[None], dtype=torch.float32, device=device)
+    actual_p = distribution(x[0].cpu().numpy())
+    for seed in range(16):
+        balance = torch.zeros(1, 8, dtype=torch.double, device=device)
+        # Bin 7 is closed; the only open bin (2) is suppressed by the fixed bubble.
+        balance[0, 7] = -2.
+        balance[0, 2] = 2.
+        original = balance.cpu().numpy()[0].copy()
+        counts = torch.zeros(1, 3, dtype=torch.long, device=device)
+        out, _ = invoke(x, balance, counts, seed=seed, proposal=torch.tensor([1], device=device),
+                        fixed_repulsor=1., dynamic_repulsor=1.)
+        token, _ = step(actual_p, original, seed, 1, fixed_repulsor=1., dynamic_repulsor=1.)
+        assert out.item() == token == 0
+        np.testing.assert_allclose(balance.cpu()[0], original, atol=1e-7)
+
+
+@pytest.mark.parametrize('overdraft, direct', [(0., 0), (.5, 0), (.75, 1)])
+def test_greedy_overdraft_diagnostics(device, overdraft, direct):
+    sampler = DADDySampler(GreedySampler(), overdraft=overdraft)
+    sampler.state.prepare(device, 1)
+    sampler.state.balances[0, 7] = -1.5
+    sampler.state.balances[0, 0] = 1.5
+    before = sampler.state.balances.clone()
+    token = sampler.forward(torch.tensor([[0., 1.]], device=device), rand_u32=0,
+                            speculative_token=torch.tensor([1], device=device))
+    assert token.item() == 1
+    assert torch.equal(sampler.state.balances, before)
+    assert sampler.state.stats()[0]['direct_proposals'] == direct
+    assert sampler.state.stats()[0]['all_full_fallbacks'] == 1 - direct
+
+
+@pytest.mark.parametrize('overdraft', [0., .5])
+def test_underflowed_mass_does_not_win_logarithmic_race(device, overdraft):
+    logits = torch.tensor([[-1000., 0.]], device=device)
+    balances = torch.zeros((1, 8), dtype=torch.double, device=device)
+    balances[0, 0] = 2.
+    balances[0, 7] = -2.
+    before = balances.clone()
+    counts = torch.zeros((1, 3), dtype=torch.long, device=device)
+    token, _ = invoke(logits, balances, counts, overdraft=overdraft)
+    assert token.item() == 1
+    assert torch.equal(balances, before)
+    assert counts[0, 2] == 1
+
+
+def test_empty_eligible_set_leaves_state_unchanged(device):
+    logits = torch.full((1, 4), -float('inf'), device=device)
+    balances = torch.zeros((1, 8), dtype=torch.double, device=device)
+    counts = torch.zeros((1, 3), dtype=torch.long, device=device)
+    token, _ = invoke(logits, balances, counts, overdraft=.5)
+    assert token.item() == 0
+    assert balances.count_nonzero() == counts.count_nonzero() == 0

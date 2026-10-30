@@ -44,6 +44,7 @@ void apply_logit_bitmask
 #define DADDY_SAMPLER_PARTIAL_FLOATS 26
 // Counter columns: direct proposals, proposal fallback draws, all-full fallbacks.
 #define DADDY_SAMPLER_COUNTS 3
+#define DADDY_SAMPLER_API_VERSION 2
 
 void daddy_sampler
 (
@@ -66,5 +67,6 @@ void daddy_sampler
     const at::Tensor& balances,
     const at::Tensor& counts,
     const c10::optional<at::Tensor>& draft,
-    uint32_t modulo
+    double overdraft,
+    double boost, double fixed_repulsor, double dynamic_repulsor
 );

@@ -42,8 +42,31 @@ def distribution(logits, mode=1, *, inv_temp=1., minp_log=0., filters=0,
     return weights / weights.sum()
 
 
-def step(probs, balances, seed, proposal=None, *, noise=None):
-    """Mutates balances once; accepts an already prepared eligible distribution."""
+def fallback_weights(balances, present, proposal_bin=None, *, proposal_given=False,
+                     overdraft=0., boost=.5, fixed_repulsor=.5, dynamic_repulsor=.75):
+    """Policy reference independent of the GPU's fused Gumbel reduction."""
+    credit = np.where(present, np.maximum(balances + overdraft, 0.), 0.)
+    if not credit.any():
+        greatest = np.max(balances[present])
+        return (present & (balances == greatest)).astype(float), 'all_full'
+    if not proposal_given:
+        return credit, 'draw'
+    shares = credit / credit.sum()
+    weights = shares + boost * np.minimum(shares, .125)
+    for center, strength in [(2, fixed_repulsor), (proposal_bin, dynamic_repulsor)]:
+        if center is not None:
+            distance = np.abs(np.arange(8) - center)
+            weights *= 1 - strength * np.where(distance <= 2, 0.5 ** distance, 0.)
+    return (weights if weights.any() else credit), 'draw'
+
+
+def step(probs, balances, seed, proposal=None, *, noise=None, overdraft=0.,
+         boost=.5, fixed_repulsor=.5, dynamic_repulsor=.75):
+    """Mutates balances once; accepts an already prepared eligible distribution.
+
+    The reference adjusts every token before sampling, rather than selecting
+    per-bin winners as the production kernel does.
+    """
     probs = np.asarray(probs, dtype=np.float64)
     eligible = probs > 0
     if not eligible.any():
@@ -55,19 +78,23 @@ def step(probs, balances, seed, proposal=None, *, noise=None):
     before = balances.copy()
     balances += mass
     present = np.bincount(bins[eligible], minlength=8) > 0
-    if proposal is not None and 0 <= proposal < len(probs) and eligible[proposal] and balances[bins[proposal]] > 0:
-        selected, token, path = bins[proposal], proposal, 'proposal'
+    proposal_bin = (int(bins[proposal]) if proposal is not None and
+                    0 <= proposal < len(probs) and eligible[proposal] else None)
+    if proposal_bin is not None and balances[proposal_bin] + overdraft > 0:
+        selected, token, path = proposal_bin, proposal, 'proposal'
     else:
-        remainder = seed & 3
-        order = list(range(7, -1, -1) if remainder == 0 else range(8))
-        open_bins = [b for b in order if present[b] and balances[b] > 0]
-        path = 'draw' if open_bins else 'all_full'
-        selected = open_bins[0] if open_bins else max((b for b in order if present[b]), key=lambda b: balances[b])
         if noise is None:
             _, noise = element_noise(seed, len(probs))
-        with np.errstate(divide='ignore'):
-            objective = np.where(eligible & (bins == selected), np.log(probs) + noise, -np.inf)
+        weights, path = fallback_weights(
+            balances, present, proposal_bin, proposal_given=proposal is not None,
+            overdraft=overdraft, boost=boost, fixed_repulsor=fixed_repulsor,
+            dynamic_repulsor=dynamic_repulsor)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            objective = np.where(eligible & (weights[bins] > 0),
+                                 np.log(probs) + noise + np.log(weights[bins]) - np.log(mass[bins]),
+                                 -np.inf)
         token = int(np.argmax(objective))
+        selected = int(bins[token])
     if np.count_nonzero(present) == 1:
         balances[:] = before
     else:

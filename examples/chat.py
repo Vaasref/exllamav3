@@ -2,6 +2,7 @@ import sys, os
 from functools import partial
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from exllamav3.generator.sampler.daddy import validate_overdraft
 import argparse
 from pathlib import Path
 import tempfile
@@ -70,7 +71,7 @@ def main(args):
     # Sampler (validate the selected pipeline before loading the model)
     sampler = model_init.get_arg_sampler(args)
     if args.daddy:
-        sampler = DADDySampler(sampler)
+        sampler = DADDySampler(sampler, overdraft=args.daddy_overdraft)
 
     # Load model
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
@@ -673,8 +674,12 @@ if __name__ == "__main__":
     parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
     parser.add_argument("-gcs", "--generator_chunk_size", type = int, default = 2048, help = "Maximum prompt-prefill chunk size, default = 2048")
     parser.add_argument("--daddy", action = "store_true", help = "Use stateful DADDy bin sampling with the selected sampling settings")
-    # Accept existing launch scripts while the sampling policy stays fixed at four.
+    # Compatibility no-op for existing launch scripts; directional selection was removed.
     parser.add_argument("--speculative_fallback_modulo", "--speculative-fallback-modulo",
                         type = int, choices = (4,), help = argparse.SUPPRESS)
+    parser.add_argument("--daddy-overdraft", "-daddy-o", type=validate_overdraft, default=0.0,
+                        help="DADDy overdraft, 0 to 5 including fractions (default: 0); potentially destructive quality/speed tradeoff")
     _args = parser.parse_args()
+    if _args.daddy_overdraft != 0.0 and not _args.daddy:
+        parser.error("--daddy-overdraft requires --daddy")
     main(_args)

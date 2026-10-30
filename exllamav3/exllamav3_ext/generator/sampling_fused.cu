@@ -5,6 +5,7 @@
 #include "../util.h"
 #include "../util.cuh"
 #include <limits>
+#include <cmath>
 #include <curand_kernel.h>
 #include "../reduction.cuh"
 
@@ -900,7 +901,8 @@ void fs_finalize_kernel
     const int num_blocks,
     const int64_t* draft = nullptr,
     int64_t* counts = nullptr,
-    const double* balances = nullptr
+    const double* balances = nullptr,
+    double overdraft = 0.0
 )
 {
     int row = blockIdx.x;
@@ -925,11 +927,11 @@ void fs_finalize_kernel
             if constexpr (DADDY_GREEDY)
             {
                 int64_t* c = counts + row * DADDY_SAMPLER_COUNTS;
-                if (draft && draft[row] == (int64_t) out[row] && balances[row * 8 + 7] + 1.0 > 0.0) ++c[0];
+                if (draft && draft[row] == (int64_t) out[row] && balances[row * 8 + 7] + 1.0 + overdraft > 0.0) ++c[0];
                 else
                 {
                     if (draft) ++c[1];
-                    if (balances[row * 8 + 7] + 1.0 <= 0.0) ++c[2];
+                    if (balances[row * 8 + 7] + 1.0 + overdraft <= 0.0) ++c[2];
                 }
             }
         }
@@ -940,7 +942,8 @@ void fs_finalize_kernel
 // decision. All paths update the same balances and return one buffered token.
 __global__ void daddy_finalize_kernel(
     const DaddyPartial* partials, int64_t* out, double* balances, int64_t* counts,
-    const int64_t* draft, int num_blocks, uint32_t random)
+    const int64_t* draft, int num_blocks, double overdraft,
+    double boost, double fixed_repulsor, double dynamic_repulsor)
 {
     int row = blockIdx.x, t = threadIdx.x;
     __shared__ ValIdx winners[8];
@@ -980,7 +983,7 @@ __global__ void daddy_finalize_kernel(
     int cb = candidate_bins[0];
     int selected = -1;
     int64_t token;
-    if (draft && cb >= 0 && balance[cb] > 0.0)
+    if (draft && cb >= 0 && balance[cb] + overdraft > 0.0)
     {
         selected = cb;
         token = draft[row];
@@ -989,18 +992,58 @@ __global__ void daddy_finalize_kernel(
     else
     {
         if (draft) ++c[1];
-        // Favor low-probability bins on three out of four fallback draws,
-        // preserving higher-bin credit for later proposals and longer speculative runs.
-        bool high_first = (random & 3u) == 0;
-        int least_full = -1;
-        for (int k = 0; k < 8; ++k)
+        double weights[8], credit[8];
+        double total_credit = 0.0;
+        double greatest = -std::numeric_limits<double>::infinity();
+        for (int b = 0; b < 8; ++b)
         {
-            int b = high_first ? 7 - k : k;
-            if (winners[b].idx == INT_MAX) continue;
-            if (least_full < 0 || balance[b] > balance[least_full]) least_full = b;
-            if (balance[b] > 0.0) { selected = b; break; }
+            // The vocabulary reduction uses float masses. Underflowed bins
+            // cannot enter a logarithmic fallback race (log(0) would win).
+            bool present = winners[b].idx != INT_MAX && masses[b] > 0.0;
+            credit[b] = present ? fmax(balance[b] + overdraft, 0.0) : 0.0;
+            weights[b] = credit[b];
+            total_credit += credit[b];
+            if (present) greatest = fmax(greatest, balance[b]);
         }
-        if (selected < 0) { selected = least_full; ++c[2]; }
+        if (total_credit == 0.0)
+        {
+            // Stranded credit in unused bins: equal weight for greatest-score ties.
+            ++c[2];
+            for (int b = 0; b < 8; ++b)
+                weights[b] = winners[b].idx != INT_MAX && masses[b] > 0.0 && balance[b] == greatest ? 1.0 : 0.0;
+        }
+        else if (draft)
+        {
+            double total_weight = 0.0;
+            for (int b = 0; b < 8; ++b)
+            {
+                double share = credit[b] / total_credit;
+                double weight = share + boost * fmin(share, 0.125);
+                int fixed_distance = abs(b - 2);
+                int dynamic_distance = cb >= 0 ? abs(b - cb) : 8;
+                double fixed_proximity = fixed_distance <= 2 ? 1.0 / (1 << fixed_distance) : 0.0;
+                double dynamic_proximity = dynamic_distance <= 2 ? 1.0 / (1 << dynamic_distance) : 0.0;
+                weights[b] = weight * (1.0 - fixed_repulsor * fixed_proximity)
+                                    * (1.0 - dynamic_repulsor * dynamic_proximity);
+                total_weight += weights[b];
+            }
+            if (total_weight == 0.0)
+                for (int b = 0; b < 8; ++b) weights[b] = credit[b];
+        }
+        // Each bin winner already contains its Gumbel draw. Remove the bin mass
+        // and substitute its desired weight, fusing bin and token selection.
+        double best = -std::numeric_limits<double>::infinity();
+        for (int b = 0; b < 8; ++b)
+        {
+            if (!(weights[b] > 0.0)) continue;
+            double value = (double) winners[b].val + log(weights[b]) - log(masses[b]);
+            if (selected < 0 || value > best ||
+                (value == best && winners[b].idx < winners[selected].idx))
+            {
+                selected = b;
+                best = value;
+            }
+        }
         token = winners[selected].idx;
     }
     if (present == 1) balance[selected] = previous;
@@ -1036,7 +1079,8 @@ void fused_sampler_impl
     const c10::optional<at::Tensor>& balances = c10::nullopt,
     const c10::optional<at::Tensor>& counts = c10::nullopt,
     const c10::optional<at::Tensor>& draft = c10::nullopt,
-    uint32_t modulo = 4
+    double overdraft = 0.0,
+    double boost = 0.5, double fixed_repulsor = 0.5, double dynamic_repulsor = 0.75
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(logits.device());
@@ -1112,7 +1156,13 @@ void fused_sampler_impl
     if constexpr (DADDY)
     {
         // Keep the native call signature compatible, but reject policy changes.
-        TORCH_CHECK(modulo == 4, "DADDy fallback modulo is fixed at 4");
+        TORCH_CHECK(std::isfinite(overdraft) && overdraft >= 0.0 && overdraft <= 5.0,
+                    "DADDy overdraft must be finite and between 0 and 5");
+        TORCH_CHECK(std::isfinite(boost) && boost >= 0.0 && boost <= 1.0,
+                    "DADDy boost must be finite and between 0 and 1");
+        TORCH_CHECK(std::isfinite(fixed_repulsor) && fixed_repulsor >= 0.0 && fixed_repulsor <= 1.0 &&
+                    std::isfinite(dynamic_repulsor) && dynamic_repulsor >= 0.0 && dynamic_repulsor <= 1.0,
+                    "DADDy repulsor strengths must be finite and between 0 and 1");
         auto check = [&](const at::Tensor& tensor, at::ScalarType dtype, int64_t elements, const char* name)
         {
             TORCH_CHECK(tensor.scalar_type() == dtype && tensor.is_contiguous() &&
@@ -1207,13 +1257,13 @@ void fused_sampler_impl
         {
             fs_finalize_kernel<true><<<bsz, FUSED_SAMPLER_MAX_BLOCKS, 0, stream>>>(
                 ws_vi, (uint64_t*) out.data_ptr(), num_blocks, draft_ptr,
-                (int64_t*) counts.value().data_ptr(), (const double*) balances.value().data_ptr());
+                (int64_t*) counts.value().data_ptr(), (const double*) balances.value().data_ptr(), overdraft);
         }
         else
         {
             daddy_finalize_kernel<<<bsz, 32, 0, stream>>>(daddy_ptr, (int64_t*) out.data_ptr(),
                 (double*) balances.value().data_ptr(), (int64_t*) counts.value().data_ptr(),
-                draft_ptr, num_blocks, random);
+                draft_ptr, num_blocks, overdraft, boost, fixed_repulsor, dynamic_repulsor);
         }
     }
     else
@@ -1354,8 +1404,9 @@ void daddy_sampler
     const at::Tensor& balances,
     const at::Tensor& counts,
     const c10::optional<at::Tensor>& draft,
-    uint32_t modulo
+    double overdraft,
+    double boost, double fixed_repulsor, double dynamic_repulsor
 )
 {
-    fused_sampler_impl<true>(logits, logit_mask, logit_bitmask, out, workspace, size, inv_temp, minp_log, random, mode, filters, top_k, top_p, inv_temp_filter, histogram, daddy_workspace, balances, counts, draft, modulo);
+    fused_sampler_impl<true>(logits, logit_mask, logit_bitmask, out, workspace, size, inv_temp, minp_log, random, mode, filters, top_k, top_p, inv_temp_filter, histogram, daddy_workspace, balances, counts, draft, overdraft, boost, fixed_repulsor, dynamic_repulsor);
 }

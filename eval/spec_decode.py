@@ -1,6 +1,7 @@
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from exllamav3 import Generator, Job, model_init, GreedySampler, TopPSampler, DADDySampler
+from exllamav3.generator.sampler.daddy import validate_overdraft
 import argparse
 import torch
 import json
@@ -187,8 +188,9 @@ def print_stats(stats_sink):
 def main(args):
     if args.ngram_corpus and args.s_ngram_match_min <= 0:
         raise ValueError("-ngram_corpus requires -ngram_min > 0")
-    sampler = DADDySampler(TopPSampler(0.9, 1)) if args.daddy else GreedySampler()
-    sampling_mode = "DADDy, top-p 0.9, temp 1" if args.daddy else "greedy"
+    sampler = DADDySampler(TopPSampler(0.9, 1), overdraft=args.daddy_overdraft) if args.daddy else GreedySampler()
+    daddy_label = f"DADDy-o {args.daddy_overdraft:g}" if args.daddy_overdraft else "DADDy"
+    sampling_mode = f"{daddy_label}, top-p 0.9" if args.daddy else "greedy"
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(
         args,
         min_draft_len = args.s_ngram_draft_length
@@ -354,5 +356,9 @@ if __name__ == "__main__":
     parser.add_argument("-dstats", "--draft_stats", type = str, help = "Write per-round (position, window, accepted) records to JSON file", default = None)
     parser.add_argument("-plot", "--plot_stats", action = "store_true", help = "Plot per-round draft stats in a matplotlib window after the run")
     parser.add_argument("-print", "--print_stats", action = "store_true", help = "Print per-round draft stats to the console after the run")
+    parser.add_argument("--daddy-overdraft", "-daddy-o", type=validate_overdraft, default=0.0,
+                        help="DADDy overdraft, 0 to 5 including fractions (default: 0); potentially destructive quality/speed tradeoff")
     _args = parser.parse_args()
+    if _args.daddy_overdraft != 0.0 and not _args.daddy:
+        parser.error("--daddy-overdraft requires --daddy")
     main(_args)
